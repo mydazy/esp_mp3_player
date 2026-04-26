@@ -104,13 +104,9 @@ bool Mp3Player::Play(const std::string& url, const std::string& title, std::stri
         set_err("previous playback not finished, retry later");
         return false;
     }
-    if (compressed_ring_) {
-        vRingbufferDeleteWithCaps(compressed_ring_);
-        compressed_ring_ = nullptr;
-    }
-    if (pcm_ring_) {
-        vRingbufferDeleteWithCaps(pcm_ring_);
-        pcm_ring_ = nullptr;
+    if (ring_buf_) {
+        vRingbufferDeleteWithCaps(ring_buf_);
+        ring_buf_ = nullptr;
     }
 
     {
@@ -119,40 +115,17 @@ bool Mp3Player::Play(const std::string& url, const std::string& title, std::stri
         current_title_ = title;
     }
 
-    compressed_ring_ = xRingbufferCreateWithCaps(
-        kCompressedRingSize, RINGBUF_TYPE_BYTEBUF, MALLOC_CAP_SPIRAM);
-    if (!compressed_ring_) {
-        ESP_LOGE(TAG, "Play failed: compressed ring alloc failed (%zu bytes)",
-                 kCompressedRingSize);
-        set_err("PSRAM exhausted");
-        return false;
-    }
-    pcm_ring_ = xRingbufferCreateWithCaps(
-        kPcmRingSize, RINGBUF_TYPE_BYTEBUF, MALLOC_CAP_SPIRAM);
-    if (!pcm_ring_) {
-        ESP_LOGE(TAG, "Play failed: pcm ring alloc failed (%zu bytes)", kPcmRingSize);
-        vRingbufferDeleteWithCaps(compressed_ring_);
-        compressed_ring_ = nullptr;
+    ring_buf_ = xRingbufferCreateWithCaps(kRingBufSize, RINGBUF_TYPE_BYTEBUF, MALLOC_CAP_SPIRAM);
+    if (!ring_buf_) {
+        ESP_LOGE(TAG, "Play failed: PSRAM ring buffer alloc failed (%zu bytes)", kRingBufSize);
         set_err("PSRAM exhausted");
         return false;
     }
 
     abort_.store(false, std::memory_order_release);
     download_done_.store(false, std::memory_order_release);
-    decode_done_.store(false, std::memory_order_release);
     active_tasks_.store(0, std::memory_order_release);
     running_.store(true, std::memory_order_release);
-
-    auto cleanup_rings = [this]() {
-        if (compressed_ring_) {
-            vRingbufferDeleteWithCaps(compressed_ring_);
-            compressed_ring_ = nullptr;
-        }
-        if (pcm_ring_) {
-            vRingbufferDeleteWithCaps(pcm_ring_);
-            pcm_ring_ = nullptr;
-        }
-    };
 
     // Download: PSRAM stack OK — one-shot I/O at low priority, tolerates flash-op stalls.
     TaskHandle_t download_task = nullptr;
@@ -162,7 +135,8 @@ bool Mp3Player::Play(const std::string& url, const std::string& title, std::stri
     if (ret != pdPASS) {
         ESP_LOGE(TAG, "Play failed: download task creation failed");
         active_tasks_.fetch_sub(1, std::memory_order_acq_rel);
-        cleanup_rings();
+        vRingbufferDeleteWithCaps(ring_buf_);
+        ring_buf_ = nullptr;
         running_.store(false, std::memory_order_release);
         set_err("failed to create download task");
         return false;
@@ -181,22 +155,6 @@ bool Mp3Player::Play(const std::string& url, const std::string& title, std::stri
         return false;
     }
 
-    // Output: prio 7 / Core 0 / internal-RAM stack 4 KB. Drains the PCM ring
-    // into the audio sink so HTTP read stalls and decode jitter never reach
-    // the I2S DMA consumer (PCM ring = ~340 ms cushion on top of the 60 ms
-    // DMA depth).
-    TaskHandle_t output_task = nullptr;
-    active_tasks_.fetch_add(1, std::memory_order_acq_rel);
-    ret = xTaskCreatePinnedToCore(
-        OutputThunk, "mp3_out", 4 * 1024, this, 7, &output_task, 0);
-    if (ret != pdPASS) {
-        ESP_LOGE(TAG, "Play failed: output task creation failed");
-        active_tasks_.fetch_sub(1, std::memory_order_acq_rel);
-        abort_.store(true, std::memory_order_release);
-        set_err("failed to create output task");
-        return false;
-    }
-
     ESP_LOGI(TAG, "Play: %s (%s)", title.c_str(), url.c_str());
     if (err_msg) err_msg->clear();
     return true;
@@ -209,13 +167,9 @@ void Mp3Player::Stop() {
 
 void Mp3Player::AbortAndJoin() {
     if (!running_.load(std::memory_order_acquire)) {
-        if (compressed_ring_) {
-            vRingbufferDeleteWithCaps(compressed_ring_);
-            compressed_ring_ = nullptr;
-        }
-        if (pcm_ring_) {
-            vRingbufferDeleteWithCaps(pcm_ring_);
-            pcm_ring_ = nullptr;
+        if (ring_buf_) {
+            vRingbufferDeleteWithCaps(ring_buf_);
+            ring_buf_ = nullptr;
         }
         return;
     }
@@ -227,18 +181,14 @@ void Mp3Player::AbortAndJoin() {
     int remaining = active_tasks_.load(std::memory_order_acquire);
     if (remaining > 0) {
         ESP_LOGW(TAG, "AbortAndJoin: %d task(s) still alive after 2 s (likely TLS read)", remaining);
-        // Don't free rings — tasks may still be writing to them.
+        // Don't free ring_buf_ — they may still be writing to it.
         return;
     }
 
     running_.store(false, std::memory_order_release);
-    if (compressed_ring_) {
-        vRingbufferDeleteWithCaps(compressed_ring_);
-        compressed_ring_ = nullptr;
-    }
-    if (pcm_ring_) {
-        vRingbufferDeleteWithCaps(pcm_ring_);
-        pcm_ring_ = nullptr;
+    if (ring_buf_) {
+        vRingbufferDeleteWithCaps(ring_buf_);
+        ring_buf_ = nullptr;
     }
 }
 
@@ -313,7 +263,7 @@ void Mp3Player::DownloadLoop() {
         size_t written = 0;
         while (written < (size_t)n && !abort_.load(std::memory_order_acquire)) {
             size_t chunk = (size_t)n - written;
-            BaseType_t ok = xRingbufferSend(compressed_ring_, buf + written, chunk,
+            BaseType_t ok = xRingbufferSend(ring_buf_, buf + written, chunk,
                                              pdMS_TO_TICKS(200));
             if (ok == pdTRUE) written += chunk;
             // else: ring full, retry next iteration
@@ -330,10 +280,7 @@ void Mp3Player::DownloadLoop() {
 void Mp3Player::DecodeThunk(void* arg) {
     auto* self = static_cast<Mp3Player*>(arg);
     self->DecodeLoop();
-    // Mark decode pipeline drained so the OutputTask can exit when the
-    // PCM ring goes empty. Ring buffers are freed by AbortAndJoin once
-    // all three tasks exit.
-    self->decode_done_.store(true, std::memory_order_release);
+    // ring_buf_ is freed by AbortAndJoin once both tasks have exited.
     self->active_tasks_.fetch_sub(1, std::memory_order_acq_rel);
     vTaskDelete(nullptr);
 }
@@ -380,11 +327,11 @@ void Mp3Player::DecodeLoop() {
             size_t want = kInBufSize - in_len;
             size_t got = 0;
             char* recv = static_cast<char*>(
-                xRingbufferReceiveUpTo(compressed_ring_, &got, pdMS_TO_TICKS(200), want));
+                xRingbufferReceiveUpTo(ring_buf_, &got, pdMS_TO_TICKS(200), want));
             if (recv) {
                 memcpy(in_buf + in_len, recv, got);
                 in_len += got;
-                vRingbufferReturnItem(compressed_ring_, recv);
+                vRingbufferReturnItem(ring_buf_, recv);
             } else {
                 if (download_done_.load(std::memory_order_acquire) && in_len == 0) {
                     ESP_LOGI(TAG, "Decode complete (data exhausted)");
@@ -468,24 +415,7 @@ void Mp3Player::DecodeLoop() {
                 }
             }
 
-            // Push PCM to the output ring (do NOT call codec directly — that
-            // would couple HTTP-read jitter back into the I2S DMA consumer).
-            // The OutputTask drains this ring at codec-paced cadence.
-            if (!pcm.empty()) {
-                const uint8_t* bytes = reinterpret_cast<const uint8_t*>(pcm.data());
-                size_t total_bytes = pcm.size() * sizeof(int16_t);
-                size_t written = 0;
-                while (written < total_bytes &&
-                       !abort_.load(std::memory_order_acquire) &&
-                       running_.load(std::memory_order_acquire)) {
-                    size_t chunk = total_bytes - written;
-                    BaseType_t ok = xRingbufferSend(pcm_ring_, bytes + written, chunk,
-                                                    pdMS_TO_TICKS(500));
-                    if (ok == pdTRUE) written += chunk;
-                    // else: PCM ring full -> Output task is draining,
-                    //       try again next iteration.
-                }
-            }
+            if (!pcm.empty() && audio_) audio_->OutputData(pcm);
 
         } else if (ret == ESP_AUDIO_ERR_CONTINUE) {
             consecutive_errors = 0;
@@ -520,59 +450,6 @@ void Mp3Player::DecodeLoop() {
     if (finished_emitted && callbacks_.on_finished) callbacks_.on_finished();
 
     ESP_LOGI(TAG, "Decode task exit");
-}
-
-// ============================================================
-// Output task: PCM ring -> audio sink (I2S DMA)
-// ============================================================
-//
-// This is the third stage of the pipeline. It exists for one reason: to make
-// the rate at which we write into the audio sink independent of every upstream
-// hiccup (HTTP read 200 ms timeout, MP3 frame edge cases, resampler open).
-// Without this task, a single TLS-read stall longer than the codec's DMA
-// depth (~60 ms on most ESP32-S3 boards) is enough to cause an audible glitch.
-
-void Mp3Player::OutputThunk(void* arg) {
-    auto* self = static_cast<Mp3Player*>(arg);
-    self->OutputLoop();
-    self->active_tasks_.fetch_sub(1, std::memory_order_acq_rel);
-    vTaskDelete(nullptr);
-}
-
-void Mp3Player::OutputLoop() {
-    if (audio_ && !audio_->output_enabled()) {
-        audio_->EnableOutput(true);
-    }
-
-    while (running_.load(std::memory_order_acquire) &&
-           !abort_.load(std::memory_order_acquire)) {
-        size_t got = 0;
-        // Long timeout: when decode is slow (e.g. first-frame setup) we
-        // simply wait, no busy-loop.
-        char* recv = static_cast<char*>(
-            xRingbufferReceiveUpTo(pcm_ring_, &got, pdMS_TO_TICKS(500), kOutputChunkBytes));
-        if (!recv) {
-            // Drain finished: decode task exited and the ring is empty.
-            if (decode_done_.load(std::memory_order_acquire)) {
-                ESP_LOGI(TAG, "Output: pipeline drained, exiting");
-                break;
-            }
-            continue;
-        }
-
-        size_t samples = got / sizeof(int16_t);
-        if (samples > 0 && audio_) {
-            // The blocking codec write naturally rate-limits this loop to
-            // the codec's playback speed. PCM ring fills/empties around it,
-            // absorbing upstream jitter.
-            std::vector<int16_t> pcm(reinterpret_cast<int16_t*>(recv),
-                                      reinterpret_cast<int16_t*>(recv) + samples);
-            audio_->OutputData(pcm);
-        }
-        vRingbufferReturnItem(pcm_ring_, recv);
-    }
-
-    ESP_LOGI(TAG, "Output task exit");
 }
 
 }  // namespace mydazy

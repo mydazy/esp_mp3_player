@@ -80,10 +80,8 @@ private:
 
     static void DownloadThunk(void* arg);
     static void DecodeThunk(void* arg);
-    static void OutputThunk(void* arg);
     void DownloadLoop();
     void DecodeLoop();
-    void OutputLoop();
 
     void AbortAndJoin();
     void EmitError(const char* status, const char* message);
@@ -95,22 +93,14 @@ private:
     std::atomic<bool> running_{false};
     std::atomic<bool> abort_{false};
     std::atomic<bool> download_done_{false};
-    std::atomic<bool> decode_done_{false};
     std::atomic<int>  active_tasks_{0};
 
     mutable std::mutex state_mutex_;
     std::string current_url_;
     std::string current_title_;
 
-    // Three-stage pipeline: HTTP -> compressed_ring -> Decode -> pcm_ring -> Output -> sink
-    // The PCM ring decouples decode jitter / HTTP read stalls from the I2S
-    // DMA consumer (~60 ms deep on most boards), eliminating the classic
-    // "single-task pipeline" underrun pattern.
-    RingbufHandle_t compressed_ring_ = nullptr;       // MP3 byte stream from HTTP
-    RingbufHandle_t pcm_ring_ = nullptr;              // resampled int16 PCM bytes
-    static constexpr size_t kCompressedRingSize = 128 * 1024;  // ~8 s @ 128 kbps
-    static constexpr size_t kPcmRingSize = 32 * 1024;          // ~340 ms @ 24 kHz mono
-    static constexpr size_t kOutputChunkBytes = 4 * 1024;      // ~85 ms @ 24 kHz mono
+    RingbufHandle_t ring_buf_ = nullptr;
+    static constexpr size_t kRingBufSize = 128 * 1024;
     static constexpr int    kHttpTimeoutMs = 15000;
 };
 

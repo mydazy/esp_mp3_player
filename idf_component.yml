@@ -1,4 +1,4 @@
-version: "0.1.0"
+version: "0.2.0"
 description: "Streaming MP3 player for ESP32-S3: HTTP chunked download → MP3 decode → resample → PCM out, fully PSRAM-resident, with abortable lifecycle. Audio output and HTTP transport are injected via abstract interfaces, so the component is project-agnostic."
 url: "https://github.com/mydazy/esp_mp3_player"
 repository: "https://github.com/mydazy/esp_mp3_player.git"

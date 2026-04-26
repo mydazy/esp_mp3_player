@@ -91,21 +91,13 @@ A complete project-agnostic example lives under `examples/basic/`.
 
 | Resource | Size | Caps | Notes |
 |---|---|---|---|
-| Compressed ring | 128 KB | `MALLOC_CAP_SPIRAM` | MP3 byte stream from HTTP → decoder. ≈ 8 s @ 128 kbps; absorbs 4G / network jitter. |
-| PCM ring | 32 KB | `MALLOC_CAP_SPIRAM` | Decoded PCM → output. ≈ 340 ms @ 24 kHz mono — absorbs decode jitter and HTTP read stalls so they never reach the I2S DMA consumer. |
+| Ring buffer | 128 KB | `MALLOC_CAP_SPIRAM` | ≈ 8 s @ 128 kbps; absorbs 4G / network jitter. |
 | Download task stack | 6 KB | `MALLOC_CAP_SPIRAM` | Core 0, priority 1. One-shot HTTP I/O — PSRAM stack is safe here. |
 | Decode task stack | 10 KB | **internal RAM** | Core 0, priority 7 — same lane as `opus_codec`. Continuous decode + I2S timing → must avoid the [PSRAM-stack ↔ flash-op deadlock](#why-internal-ram-stack-for-decode). |
-| Output task stack | 4 KB | **internal RAM** | Core 0, priority 7. Drains PCM ring → `IAudioOutput::OutputData`. Same flash-op rationale as Decode. |
 | HTTP read scratch | 2 KB | `MALLOC_CAP_SPIRAM` | TLS handshake leaves little stack room — keep the buffer off the stack. |
 | Decoder I/O buffers | 8 KB + ~4.6 KB | `MALLOC_CAP_SPIRAM` | One MP3 frame = 1152 samples × 2 ch × `int16_t`. |
 
-**Net internal-SRAM increment vs. baseline: ~14 KB (decode + output task stacks).** Everything else is PSRAM-resident.
-
-### Why the three-stage pipeline?
-
-The codec's I2S DMA buffer is shallow (~60 ms on most ESP32-S3 boards: `dma_desc_num=6 × dma_frame_num=240` ÷ 24 kHz). If the decode task wrote PCM into the codec directly, **any** upstream stall longer than 60 ms — a TLS retransmit, a 4G handover, even just the first-frame `esp_audio_dec_get_info` setup — would underrun the DMA and cause an audible click.
-
-The Output task and PCM ring decouple the codec write from upstream timing. The PCM ring (~340 ms) is a buffer ten times larger than the typical jitter source, so the codec's I2S consumer always has data to draw from. This mirrors the pattern used in ESP-ADF (`audio_pipeline` with element-to-element ringbuffers) and in many production codec stacks.
+**Net internal-SRAM increment vs. baseline: ~10 KB (decode task stack only).** Everything else is PSRAM-resident.
 
 ### Why internal-RAM stack for decode?
 
